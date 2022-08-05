@@ -119,7 +119,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Execute the downstream request
 	resp, err := d.client.Do(proxyReq)
 	if err != nil {
-
+		d.writeErr("Error sending downstream request", 500, log, err, writer)
 		return
 	}
 
