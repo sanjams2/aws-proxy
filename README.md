@@ -1,9 +1,13 @@
 ## AWS Proxy
 ### Overview
-This is a simple program that runs a server that can receive
-a request to any AWS service and resign the request with new
-credentials before sending it to the originally intended 
-service
+This is a simple program that can proxy any AWS SigV4 request, resign with specified credentials, 
+and send it to the originally intended service.
+
+How is this different from https://github.com/awslabs/aws-sigv4-proxy? The `aws-sigv4-proxy` library
+requires that the entire request body be read and loaded into memory. This is due to a limitation in 
+the aws golang sdk v1. This package instead utilizes the v2 sdk and therefore can detect
+if the body needs to be read entirely or not. This is particularly useful when sending large objects
+to S3. 
 
 ### Usage
 Build:
