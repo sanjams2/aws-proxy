@@ -10,6 +10,8 @@ if the body needs to be read entirely or not. This is particularly useful when s
 to S3. 
 
 ### Usage
+First, clone the repository. Then...
+
 Build:
 ```
 go build .
@@ -33,6 +35,20 @@ aws --profile unauthorized-profile s3 cp \
     --endpoint-url http://localhost:8080 \
     /tmp/some/local/file.txt \
     s3://bucket/key.txt
+```
+
+#### Docker
+Build the image
+```bash
+docker build . -t aws-proxy
+```
+
+Run the image
+```bash
+docker run \
+-p 8080:8080 \
+-v ~/.aws:/root/.aws \
+aws-proxy -port 8080
 ```
 
 ### Current Limitations

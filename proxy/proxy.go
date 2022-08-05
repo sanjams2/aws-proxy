@@ -8,6 +8,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
+	"os"
 
 	"io"
 	"io/ioutil"
@@ -37,6 +39,7 @@ type proxyHandler struct {
 	client    *http.Client
 	config    *aws.Config
 	debug     bool
+	logger    *logrus.Logger
 }
 
 func NewProxyHandler(client *http.Client, config *aws.Config, debug bool) http.Handler {
@@ -44,40 +47,49 @@ func NewProxyHandler(client *http.Client, config *aws.Config, debug bool) http.H
 		s.LogSigning = debug
 		s.Logger = config.Logger
 	})
+	logger := logrus.New()
+	logger.Formatter = &logrus.JSONFormatter{}
+	logger.Out = os.Stdout
+	logger.Level = logrus.InfoLevel
+	if debug {
+		logger.Level = logrus.DebugLevel
+	}
 	return &proxyHandler{
 		signer:    signer,
 		client:    client,
 		config:    config,
 		debug:     debug,
+		logger:	   logger,
 	}
 }
 
 func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	reqId := uuid.New().String()
+	log := logrus.NewEntry(d.logger).WithField("requestId", reqId)
 
 	// determine request region and service
 	region, service := d.getRequestScope(request)
 	if region == "" || service == "" {
-		fmt.Printf("[%s] Unable to determine region/service of request. Request may not be signed\n", reqId)
+		log.Error("Unable to determine region/service of request. Request may not be signed")
 		writer.WriteHeader(400)
 		return
 	}
 
-	fmt.Printf("[%s] Received request for region: %s, service: %s\n", reqId, region, service)
+	log.WithField("region", region).WithField("service", service).Info("Received Request")
 
 	// Determine awsEndpoint from service and region of request
 	awsEndpoint, err := d.config.EndpointResolver.ResolveEndpoint(service, region)
 	if err != nil {
-		fmt.Printf("[%s] Error determining awsEndpoint: %v\n", reqId, err)
+		log.WithError(err).Error("Error determining awsEndpoint")
 		writer.WriteHeader(500)
 		return
 	}
 
 	// Copy incoming request to a new outgoing request
 	d.logHeaders("Original Headers", request)
-	proxyReq, err := d.initializeDownstreamRequest(request, awsEndpoint)
+	proxyReq, err := d.initializeDownstreamRequest(request, awsEndpoint, log)
 	if err != nil {
-		fmt.Printf("[%s] Error creating proxy request: %v\n", reqId, err)
+		log.WithError(err).Error("Error creating proxy request")
 		writer.WriteHeader(500)
 		return
 	}
@@ -85,7 +97,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Calculate the payload hash
 	payloadHash, err := d.getPayloadHash(proxyReq)
 	if err != nil {
-		fmt.Printf("[%s] Error configuring downstream request body: %v\n", reqId, err)
+		log.WithError(err).Error("Error configuring downstream request body")
 		writer.WriteHeader(500)
 		return
 	}
@@ -93,7 +105,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Get signing credentials
 	creds, err := d.config.Credentials.Retrieve(context.TODO())
 	if err != nil {
-		fmt.Printf("[%s] Error retrieving creds: %v\n", reqId, err)
+		log.WithError(err).Error("Error retrieving creds")
 		writer.WriteHeader(500)
 		return
 	}
@@ -101,7 +113,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Sign the request
 	scrubbedHeaders := d.scrubUnsignableHeaders(proxyReq)
 	if err = d.signer.SignHTTP(context.TODO(), creds, proxyReq, payloadHash, service, awsEndpoint.SigningRegion, time.Now()); err != nil {
-		fmt.Printf("[%s] Error signing request: %v\n", reqId, err)
+		log.WithError(err).Error("Error signing request")
 		writer.WriteHeader(500)
 		return
 	}
@@ -111,7 +123,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Execute the downstream request
 	resp, err := d.client.Do(proxyReq)
 	if err != nil {
-		fmt.Printf("[%s] Error making request: %v\n", reqId, err)
+		log.WithError(err).Error("Error making request")
 		writer.WriteHeader(500)
 		return
 	}
@@ -119,10 +131,10 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Ensure body gets closed
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			fmt.Println("error closing body", err)
+			log.WithError(err).Error("error closing body")
 		}
 	}()
-	fmt.Printf("[%s] Received response with status: %d\n", reqId, resp.StatusCode)
+	log.WithField("statusCode", resp.StatusCode).Info("Received response")
 
 	// Write response
 	for h, val := range resp.Header {
@@ -132,12 +144,12 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Streams response, may get tricky if the downstream service is slow and
 	// golang automagically turns the request response into a chunked-encoded response
 	if _, err = io.Copy(writer, resp.Body); err != nil {
-		fmt.Println("error writing body", err)
+		log.WithError(err).Error("error writing body")
 	}
 }
 
 // Copies an *http.Request to a new *http.Request that can be used to make outbound calls
-func (d *proxyHandler) initializeDownstreamRequest(request *http.Request, awsEndpoint aws.Endpoint) (*http.Request, error) {
+func (d *proxyHandler) initializeDownstreamRequest(request *http.Request, awsEndpoint aws.Endpoint, log *logrus.Entry) (*http.Request, error) {
 	// TODO: maybe consider http requests
 	host := strings.TrimPrefix(awsEndpoint.URL, "https://")
 	url := fmt.Sprintf("https://%s%s", host, request.RequestURI)
@@ -162,7 +174,7 @@ func (d *proxyHandler) initializeDownstreamRequest(request *http.Request, awsEnd
 	if contentLength := request.Header.Get("Content-Length"); contentLength != "" {
 		i, err := strconv.Atoi(contentLength)
 		if err != nil {
-			fmt.Printf("error converting content length: %v\n", contentLength)
+			log.WithError(err).Error("error converting content length")
 		} else {
 			proxyReq.ContentLength = int64(i)
 		}

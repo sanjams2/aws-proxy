@@ -18,7 +18,7 @@ func main() {
 	partition := flag.String("aws-partition", "aws", "aws partition to use")
 	flag.Parse()
 
-	addr := fmt.Sprintf("localhost:%d", *port)
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(),
 		config.WithEndpointResolver(defaultEndpointResolver(*partition)),
