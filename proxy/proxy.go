@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -70,8 +71,8 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// determine request region and service
 	region, service := d.getRequestScope(request)
 	if region == "" || service == "" {
-		log.Error("Unable to determine region/service of request. Request may not be signed")
-		writer.WriteHeader(400)
+		err := errors.New("Unable to determine region/service of request. Request may not be signed")
+		d.writeErr("Error getting request scope", 400, log, err, writer)
 		return
 	}
 
@@ -80,8 +81,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Determine awsEndpoint from service and region of request
 	awsEndpoint, err := d.config.EndpointResolver.ResolveEndpoint(service, region)
 	if err != nil {
-		log.WithError(err).Error("Error determining awsEndpoint")
-		writer.WriteHeader(500)
+		d.writeErr("Error determining awsEndpoint", 500, log, err, writer)
 		return
 	}
 
@@ -89,32 +89,28 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	d.logHeaders("Original Headers", request)
 	proxyReq, err := d.initializeDownstreamRequest(request, awsEndpoint, log)
 	if err != nil {
-		log.WithError(err).Error("Error creating proxy request")
-		writer.WriteHeader(500)
+		d.writeErr("Error creating proxy request", 500, log, err, writer)
 		return
 	}
 
 	// Calculate the payload hash
 	payloadHash, err := d.getPayloadHash(proxyReq)
 	if err != nil {
-		log.WithError(err).Error("Error configuring downstream request body")
-		writer.WriteHeader(500)
+		d.writeErr("Error configuring downstream request body", 500, log, err, writer)
 		return
 	}
 
 	// Get signing credentials
 	creds, err := d.config.Credentials.Retrieve(context.TODO())
 	if err != nil {
-		log.WithError(err).Error("Error retrieving creds")
-		writer.WriteHeader(500)
+		d.writeErr("Error retrieving creds", 500, log, err, writer)
 		return
 	}
 
 	// Sign the request
 	scrubbedHeaders := d.scrubUnsignableHeaders(proxyReq)
 	if err = d.signer.SignHTTP(context.TODO(), creds, proxyReq, payloadHash, service, awsEndpoint.SigningRegion, time.Now()); err != nil {
-		log.WithError(err).Error("Error signing request")
-		writer.WriteHeader(500)
+		d.writeErr("Error signing request", 500, log, err, writer)
 		return
 	}
 	d.addHeaders(proxyReq, scrubbedHeaders)
@@ -123,8 +119,7 @@ func (d *proxyHandler) ServeHTTP(writer http.ResponseWriter, request *http.Reque
 	// Execute the downstream request
 	resp, err := d.client.Do(proxyReq)
 	if err != nil {
-		log.WithError(err).Error("Error making request")
-		writer.WriteHeader(500)
+
 		return
 	}
 
@@ -240,6 +235,14 @@ func (d *proxyHandler) scrubUnsignableHeaders(req *http.Request) http.Header {
 func (d *proxyHandler) addHeaders(req *http.Request, headers http.Header) {
 	for k, v := range headers {
 		req.Header[k] = v
+	}
+}
+
+func (d *proxyHandler) writeErr(msg string, statusCode int, log *logrus.Entry, err error, writer http.ResponseWriter) {
+	log.WithError(err).Error(msg)
+	writer.WriteHeader(statusCode)
+	if _, werr := io.Copy(writer, bytes.NewBufferString(err.Error())); werr != nil {
+		log.WithError(werr).Error("error sending error")
 	}
 }
 
